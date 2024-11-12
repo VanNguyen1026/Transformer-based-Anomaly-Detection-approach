@@ -1,0 +1,312 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+!cp -r /content/drive/MyDrive/WORKING/Federated_Learning/AnoFED_ALI/ECG5000.zip /content/
+
+#=====================================================================Import Libraries========================================================================
+import os
+import random
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.models import Model
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.neighbors import KernelDensity
+from cvxopt import matrix, solvers
+import sklearn.metrics.pairwise as smp
+
+#========== Data Preprocessing ============#
+!unzip ECG5000.zip
+!cat ECG5000_TRAIN.txt ECG5000_TEST.txt > ecg_final.txt
+
+df = pd.read_csv('ecg_final.txt', sep='  ', header=None, engine='python')
+df = df.add_prefix('c')
+df['c0'] = df['c0'].apply(lambda x: 1 if x > 1 else 0)
+
+train_data, test_data, train_labels, test_labels = train_test_split(df.values, df.values[:, 0:1], test_size=0.2, random_state=111)
+scaler = MinMaxScaler()
+data_scaled = scaler.fit_transform(train_data)
+
+train_data_scaled = scaler.transform(train_data)
+test_data_scaled = scaler.transform(test_data)
+
+# Splitting data into normal and anomaly
+normal_train_data = train_data_scaled[train_data_scaled[:, 0] == 0][:, 1:]
+anomaly_train_data = train_data_scaled[train_data_scaled[:, 0] == 1][:, 1:]
+normal_test_data = test_data_scaled[test_data_scaled[:, 0] == 0][:, 1:]
+anomaly_test_data = test_data_scaled[test_data_scaled[:, 0] == 1][:, 1:]
+
+# Reshape data
+normal_train_data = normal_train_data[..., np.newaxis]
+anomaly_train_data = anomaly_train_data[..., np.newaxis]
+normal_test_data = normal_test_data[..., np.newaxis]
+anomaly_test_data = anomaly_test_data[..., np.newaxis]
+train_data_scaled = train_data_scaled[:, 1:][..., np.newaxis]
+test_data_scaled = test_data_scaled[:, 1:][..., np.newaxis]
+
+#=============== Design the Transformer-based Autoencoder ===============#
+input_shape = normal_train_data.shape[1:]
+input_data = keras.Input(shape=input_shape)
+num_patches = 1
+projection_dim = 10
+num_heads = 2
+transformer_units = [projection_dim * 2, projection_dim]
+transformer_layers = 2
+
+# Data augmentation layer
+data_augmentation = keras.Sequential([
+    layers.Normalization(),
+], name="data_augmentation")
+
+# MLP block
+def mlp(x, hidden_units, dropout_rate):
+    for units in hidden_units:
+        x = layers.Dense(units, activation='relu')(x)
+        x = layers.Dropout(dropout_rate)(x)
+    return x
+
+# Patch Encoder class
+class PatchEncoder(layers.Layer):
+    def __init__(self, num_patches, projection_dim=6, **kwargs):
+        super(PatchEncoder, self).__init__(**kwargs)
+        self.num_patches = num_patches
+        self.projection = layers.Dense(units=projection_dim)
+        self.position_embedding = layers.Embedding(input_dim=num_patches, output_dim=projection_dim)
+
+    def call(self, patch):
+        positions = tf.range(start=0, limit=self.num_patches, delta=1)
+        return self.projection(patch) + self.position_embedding(positions)
+
+# Sampling function for VAE
+def sample(args):
+    z_mean, z_log_var = args
+    batch = K.shape(z_mean)[0]
+    dim = K.int_shape(z_mean)[1]
+    epsilon = K.random_normal(shape=(batch, dim))
+    return z_mean + K.exp(0.5 * z_log_var) * epsilon
+
+# Loss function
+def get_error_term(v1, v2, _rmse=True):
+    if _rmse:
+        return np.sqrt(np.mean((v1 - v2) ** 2, axis=1))
+    return np.mean(abs(v1 - v2), axis=1)
+
+# Encoder inputs and augmentation
+encoder_inputs = layers.Input(shape=input_shape)
+augmented = data_augmentation(encoder_inputs)
+encoded_patches = PatchEncoder(num_patches, projection_dim)(augmented)
+
+# Transformer layers
+for _ in range(transformer_layers):
+    x1 = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
+    attention_output = layers.MultiHeadAttention(num_heads=num_heads, key_dim=projection_dim, dropout=0.1)(x1, x1)
+    x2 = layers.Add()([attention_output, encoded_patches])
+    x3 = layers.LayerNormalization(epsilon=1e-6)(x2)
+    x3 = mlp(x3, hidden_units=transformer_units, dropout_rate=0.1)
+    encoded_patches = layers.Add()([x3, x2])
+
+# Flattening and creating the encoder model
+x = layers.Flatten()(encoded_patches)
+x = layers.Dense(100, activation='relu')(x)
+encoder = Model(encoder_inputs, x, name='encoder')
+
+# Decoder model
+latent_inputs = layers.Input(shape=(x.shape[1],), name='z_sampling')
+x = layers.Dense(np.prod(encoded_patches.shape[1:]), activation='relu')(latent_inputs)
+x = layers.Reshape(encoded_patches.shape[1:])(x)
+x = layers.Dense(100, activation='relu')(x)
+outputs = layers.Dense(1, activation='sigmoid', name='decoder_output')(x)
+decoder = Model(latent_inputs, outputs, name='decoder')
+
+# VAE Model
+outputs = decoder(encoder(encoder_inputs))
+vae_model = Model(encoder_inputs, outputs, name='vae_mlp')
+vae_model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001, clipvalue=0.5), loss='mse')
+
+#=============== Train the Autoencoder ===============#
+vae_model.fit(normal_train_data, normal_train_data, shuffle=True, epochs=3, validation_data=(train_data_scaled, train_data_scaled), batch_size=7)
+
+#=============== Evaluation and Visualization ===============#
+reconstructions = vae_model.predict(normal_test_data)
+mae_vector = get_error_term(reconstructions, normal_test_data, _rmse=False)
+threshold = np.mean(mae_vector) + 2.3 * np.std(mae_vector)
+
+reconstructions_an = vae_model.predict(anomaly_test_data)
+mae_vector_an = get_error_term(reconstructions_an, anomaly_test_data, _rmse=False)
+
+# Plot the reconstruction errors
+plt.hist(mae_vector_an, bins=50, label='abnormal')
+plt.hist(mae_vector, bins=50, label='normal')
+plt.axvline(threshold, color='r', linewidth=3, linestyle='dashed', label='{:0.3f}'.format(threshold))
+plt.legend(loc='upper right')
+plt.show()
+
+# Predictions and Classification Report
+reconstructions_asc = vae_model.predict(test_data_scaled)
+mae_vector_asc = get_error_term(reconstructions_asc, test_data_scaled, _rmse=False)
+anomalies = (mae_vector_asc > threshold)
+print(classification_report(test_labels, anomalies))
+
+#============== SVDD Model Implementation ==============#
+class SVDD():
+    def __init__(self, parameters):
+        self.parameters = parameters
+
+    def train(self, data, label):
+        label = np.array(label, dtype='int')
+        pIndex = label[:, 0] == 1
+        nIndex = label[:, 0] == -1
+        threshold = 1e-7
+        K = self.getMatrix(data, data)
+        alf, obj, iteration = self.quadprog(K, label)
+        sv_index = np.where(alf > threshold)[0][:]
+        sv_value = data[sv_index, :]
+        sv_alf = alf[sv_index]
+        center = np.dot(alf.T, data)
+        term_1 = K[sv_index[0], sv_index[0]]
+        term_2 = -2 * np.dot(K[sv_index[0], :], alf)
+        term_3 = np.dot(np.dot(alf.T, K), alf)
+        radius = np.sqrt(term_1 + term_2 + term_3)
+        self.model = {
+            "data": data,
+            "sv_alf": sv_alf,
+            "radius": radius,
+            "sv_value": sv_value,
+            "sv_index": sv_index,
+            "center": center,
+            "term_3": term_3,
+            "alf": alf,
+            "K": K,
+            "pIndex": pIndex,
+            "nIndex": nIndex,
+            "obj": obj,
+            "iteration": iteration
+        }
+
+    def test(self, data, label):
+        n = data.shape[0]
+        K = self.getMatrix(data, self.model["data"])
+        term_1 = self.getMatrix(data, data)
+        term_2 = -2 * np.dot(K, self.model["alf"])
+        term_3 = self.model["term_3"]
+        distance = np.sqrt(np.diagonal(term_1 + term_2 + term_3))
+        predictedlabel = np.mat(np.ones(n)).T
+        fault_index = np.where(distance > self.model["radius"])[0]
+        predictedlabel[fault_index] = -1
+        accuracy = np.sum(predictedlabel == label) / n
+        return distance, accuracy
+
+    def predict_labelV(self, data, cl):
+        n = data.shape[0]
+        K = self.getMatrix(data, self.model["data"])
+        term_1 = self.getMatrix(data, data)
+        term_2 = -2 * np.dot(K, self.model["alf"])
+        term_3 = self.model["term_3"]
+        distance = np.sqrt(np.diagonal(term_1 + term_2 + term_3))
+        predictedlabel = np.mat(np.ones(n)).T
+        fault_indices = np.where(distance > cl)
+        predictedlabel[fault_indices, :] = -1
+        return predictedlabel
+
+    def getMatrix(self, X, Y):
+        kernelType = self.parameters["kernel"]["type"]
+        if kernelType == "gauss":
+            s = self.parameters["kernel"].get("width", 2)
+            return smp.rbf_kernel(X, Y, gamma=s)
+        elif kernelType == "linear":
+            c = self.parameters["kernel"].get("offset", 0)
+            return smp.linear_kernel(X, Y) + c
+        elif kernelType == "ploy":
+            d = self.parameters["kernel"].get("degree", 2)
+            c = self.parameters["kernel"].get("offset", 0)
+            return smp.polynomial_kernel(X, Y, degree=d, coef0=c)
+        elif kernelType == "lapl":
+            s = self.parameters["kernel"].get("width", 2)
+            return smp.laplacian_kernel(X, Y, gamma=s)
+        elif kernelType == "tanh":
+            g = self.parameters["kernel"].get("gamma", 0.01)
+            c = self.parameters["kernel"].get("offset", 1)
+            return smp.sigmoid_kernel(X, Y, gamma=g, coef0=c)
+        else:
+            raise ValueError("Unsupported kernel type")
+
+#============== SVDD Training and Testing ==============#
+parameters = {
+    "positive penalty": 0.9,
+    "negative penalty": 0.7,
+    "kernel": {"type": 'lapl', "width": 0.5},
+    "option": {"display": 'off'}
+}
+
+svdd = SVDD(parameters)
+train_label_svdd = np.where(train_labels == 1, -1, train_labels)
+train_label_svdd = np.where(train_label_svdd == 0, 1, train_label_svdd)
+test_label_svdd = np.where(test_labels == 1, -1, test_labels)
+test_label_svdd = np.where(test_label_svdd == 0, 1, test_label_svdd)
+
+svdd.train(train_data_scaled[:, :, 0], train_label_svdd)
+distance, accuracy = svdd.test(test_data_scaled[:, :, 0], test_label_svdd)
+print(f"SVDD Test Accuracy: {accuracy * 100:.2f}%")
+
+# Predict labels using SVDD
+predicted_labels = svdd.predict_labelV(test_data_scaled[:, :, 0], cl=svdd.model["radius"])
+
+# Convert predicted_labels to a 1D array
+predicted_labels = np.array(predicted_labels).flatten()
+
+# Print classification report and confusion matrix
+print("Classification Report:")
+print(classification_report(test_label_svdd, predicted_labels))
+
+print("Confusion Matrix:")
+print(confusion_matrix(test_label_svdd, predicted_labels))
+
+#============== SVDD Visualization ==============#
+class Visualization():
+    def testResult(svdd, distance):
+        plt.rcParams['font.size'] = 15
+        n = distance.shape[0]
+
+        fig = plt.figure(figsize=(10, 6))
+        ax = fig.add_subplot(1, 1, 1)
+        radius = np.ones((n, 1)) * svdd.model["radius"]
+        ax.plot(radius, color='r', linestyle='-', linewidth=2)
+        ax.plot(distance, color='k', linestyle=':', marker='o', linewidth=1, markeredgecolor='k', markerfacecolor='C4', markersize=6)
+        ax.set_xlabel('Samples')
+        ax.set_ylabel('Distance')
+        ax.legend(["Radius", "Distance"], ncol=1, loc=0, edgecolor='black', markerscale=2, fancybox=True)
+        plt.show()
+
+    def testROC(label, distance):
+        if np.abs(np.sum(label)) == label.shape[0]:
+            raise SyntaxError('Both positive and negative labels must be entered for plotting ROC curve.')
+
+        plt.rcParams['font.size'] = 15
+        n_p = np.sum(label == 1)
+        n_n = np.sum(label == -1)
+        index = np.argsort(distance)
+        label_sort = label[index]
+        FP = np.cumsum(label_sort == -1)
+        TP = np.cumsum(label_sort == 1)
+        FPR = FP / n_n
+        TPR = TP / n_p
+        roc_auc = auc(FPR.T, TPR.T)
+
+        fig = plt.figure(figsize=(6, 6))
+        ax = fig.add_subplot(1, 1, 1)
+        ax.plot(FPR.T, TPR.T, color='C3', linestyle='-', linewidth=5)
+        ax.set_xlabel('False positive rate (FPR)')
+        ax.set_ylabel('True positive rate (TPR)')
+        ax.set_title('Area under the curve (AUC) = %.4f' % roc_auc)
+        plt.grid()
+        plt.show()
+
+# Visualize SVDD results
+Visualization.testResult(svdd, distance)
+Visualization.testROC(test_label_svdd, distance)
